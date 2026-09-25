@@ -1,8 +1,27 @@
 # LeagueSphere App Review: Remediation Plan
 
 **Date:** 2026-09-25
-**Status:** Proposed
+**Status:** Phases 1-3 done (2026-09-25). Phase 4-5 not started.
 **Source:** Two independent code reviews of the whole app group (Django backend, five React apps, container and CI config), merged and re-prioritized. Findings come from reading code and running `black --check`; no tests were run and nothing was changed on the app itself.
+
+## Progress
+
+| Phase | Status | PR |
+|---|---|---|
+| 1 — Settings and edge hardening | ✅ Done | merged directly to `master` (`e9aa7eda`) |
+| 2 — Escaping, validation and access decisions | ✅ Done | [#1978](https://github.com/dachrisch/leaguesphere/pull/1978) |
+| 3 — Shared cache and server-side result caching | ✅ Code done, **not deployed** | [#1979](https://github.com/dachrisch/leaguesphere/pull/1979) (suggestion PR) |
+| 4 — Process, docs and repo hygiene | Not started | — |
+| 5 — Frontend and backend code quality | Not started | — |
+
+Notes on how execution diverged from the plan as written:
+
+- All work was done from a sandboxed environment with no LXC/MariaDB test container and no access to stage/prod or the container repo's Ansible flow. Every fix was verified with `pytest` against `league_manager.settings.test_sqlite` instead of the real MySQL test DB, and nothing was verified with `curl`/click-through on stage as the "Verify" steps below call for — that step is still outstanding for every phase.
+- **2.1** additionally fixed three related unescaped-output bugs found while adding test coverage on the same pages, beyond the five original `escape: False` sites: `EventsTableError`'s message (independent of the `to_html` escape flag), a JSON-LD `<script type="application/ld+json">` payload that could be broken out of with a team name containing `</script>`, and a stray `|safe` on `GameSetup.note` that had no markup to protect.
+- **2.3** used the nginx `limit_req_zone` option, not `django-axes` — this fork has no Ansible/Redis access to satisfy axes' "needs a shared cache" prerequisite either, so the tradeoffs called out in the plan apply as written (doesn't cover `/api/accounts/auth/login/`; no automated regression test, since it's pure nginx config).
+- **3.1**'s compose/settings/dependency changes are complete and locally verified (real Redis read/write, `docker-compose config` validation for all three files) but genuinely cannot be deployed from here — see PR #1979.
+- **3.2** covers `LeagueTableAPIView.get()` and `GamedayViewSet.list()` only; the journey progress feed has no `etag_func` yet, so it needs one designed before this pattern applies there too.
+- Discovered while adding 3.2's test coverage: under sqlite, `TestCase`'s savepoint rollback means rowids can be reused across tests, so two unrelated tests can compute the same ETag and one can serve the other's cached payload. Not a production risk (MySQL `AUTO_INCREMENT` never reuses pks), but real in this test suite — fixed by clearing the cache in the affected test base classes' `setUp()`.
 
 Read this top to bottom. Phases are ordered by risk first, then effort. Each item says **what** is wrong, **where** it lives, **how** to fix it and **how to prove it**. Effort is S (under an hour), M (half a day), L (a day or more).
 
@@ -35,7 +54,7 @@ Read this top to bottom. Phases are ordered by risk first, then effort. Each ite
 
 ---
 
-## Phase 1: Settings and edge hardening (one PR, no behaviour risk)
+## Phase 1: Settings and edge hardening (one PR, no behaviour risk) — ✅ Done
 
 Goal: close every High that is a config change. Target: a single PR touching `league_manager/settings/base.py`, `league_manager/settings/prod.py`, `league_manager/settings/stage.py` and the three nginx confs.
 
@@ -93,9 +112,11 @@ Goal: close every High that is a config change. Target: a single PR touching `le
 
 **Phase 1 done when:** `check --deploy` is clean for prod, stage shows the new headers, all existing tests pass, and the PR is under about 60 changed lines.
 
+**Status:** Done, merged to `master` (`e9aa7eda`). `check --deploy` is clean and all existing tests pass; the "stage shows the new headers" verification is still outstanding (no stage access from this environment).
+
 ---
 
-## Phase 2: Escaping, validation and access decisions
+## Phase 2: Escaping, validation and access decisions — ✅ Done ([#1978](https://github.com/dachrisch/leaguesphere/pull/1978))
 
 ### 2.1 Stop rendering unescaped HTML from user-controlled names (item 4)
 - **Where:** `gamedays/views.py:142`, `:228`, `:473`, `gamedays/service/tournament_service.py:114`, `matchreport/constants.py:30`, all `"escape": False` passed to pandas `to_html`, then `|safe` in `gamedays/templates/gamedays/statistics/league_statistics.html` and `matchreport/templates/matchreport/gameday_detail.html`.
@@ -130,9 +151,11 @@ Goal: close every High that is a config change. Target: a single PR touching `le
 
 **Phase 2 done when:** every `escape=False` and `mark_safe` call site has a test proving escaping, logins lock out, journey POSTs validate, and the roster decision is documented.
 
+**Status:** Done, see [#1978](https://github.com/dachrisch/leaguesphere/pull/1978). Every item covered, including three bonus escaping fixes found on the way (see the Progress notes above). Login rate-limiting is nginx-based (verified locally against a stub backend), not django-axes — see 2.3 above.
+
 ---
 
-## Phase 3: Shared cache and server-side result caching
+## Phase 3: Shared cache and server-side result caching — ✅ Code done, not deployed ([#1979](https://github.com/dachrisch/leaguesphere/pull/1979))
 
 ### 3.1 Replace `LocMemCache` with Redis (item 10)
 - **Where:** `base.py:62`; gunicorn runs `-w 6 --threads 2` in `deployed/docker-compose.yaml:42` and the demo and staging compose files.
@@ -149,6 +172,8 @@ Goal: close every High that is a config change. Target: a single PR touching `le
 - **Verify:** Test with `assertNumQueries`: the second request with the same ETag runs only the ETag query. Run `k6 run load-test-k6.js` before and after and compare p95 in the Grafana k6 dashboard.
 
 **Phase 3 done when:** Redis is deployed to stage and prod through Ansible, the throttle and maintenance behaviour are consistent across workers, and the k6 comparison is written to `docs/topics/` under reports.
+
+**Status:** Code complete and locally verified (real Redis read/write through Django's cache API, `docker-compose config` validated for all three environments) in [#1979](https://github.com/dachrisch/leaguesphere/pull/1979) — but genuinely **not deployable from this fork**: no access to the container repo's Ansible flow. Treat #1979 as a suggestion PR; the Ansible rollout, stage/prod verification and k6 before/after comparison are all still outstanding and need someone with real infra access.
 
 ---
 
